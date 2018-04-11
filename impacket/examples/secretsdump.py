@@ -42,14 +42,19 @@
 # http://www.ntdsxtract.com/downloads/ActiveDirectoryOfflineHashDumpAndForensics.pdf
 # http://www.passcape.com/index.php?section=blog&cmd=details&id=15
 #
+
+from __future__ import print_function
+
 import codecs
 import hashlib
 import logging
 import ntpath
 import os
+import sys
 import random
 import string
 import time
+import json
 from binascii import unhexlify, hexlify
 from collections import OrderedDict
 from datetime import datetime
@@ -80,6 +85,11 @@ except ImportError:
     LOG.critical("Warning: You don't have any crypto installed. You need PyCrypto")
     LOG.critical("See http://www.pycrypto.org/")
 
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)    
+
+def ndjsondump(o, f):
+    f.write(json.dumps(o, skipkeys=True, indent=0, separators=(',',':')).replace('\n','').replace('\r','') + '\n')
 
 # Structures
 # Taken from http://insecurety.net/?p=768
@@ -192,6 +202,27 @@ class USER_ACCOUNT_V(Structure):
         ('NTHashLength','<L=0'),
         ('Unknown14','<L=0'),
         ('Unknown15','24s=""'),
+        ('Data',':=""'),
+    )
+    
+class USER_ACCOUNT_F(Structure):
+    structure = (
+        ('Version','<L=0'),
+        ('Unknown','<L=0'),
+        ('LastLogon','<Q=0'),
+        ('LastLogoff','<Q=0'),
+        ('PasswordLastSet','<Q=0'),
+        ('AccountExpires','<Q=0'),
+        ('BadPasswordTime','<Q=0'),
+        ('Rid','<L=0'),
+        ('PrimaryGroupId','<L=0'),
+        ('UserAccountControl','<L=0'),
+        ('CountryCode','<H=0'),
+        ('CodePage','<H=0'),
+        ('BadPasswordCount','<H=0'),
+        ('LogonCount','<H=0'),
+        ('AdminCount','<H=0'),
+        ('OperatorCount','<H=0'),
         ('Data',':=""'),
     )
 
@@ -1103,7 +1134,7 @@ class OfflineRegistry:
             self.__registryHive.close()
 
 class SAMHashes(OfflineRegistry):
-    def __init__(self, samFile, bootKey, isRemote = False, perSecretCallback = lambda secret: _print_helper(secret)):
+    def __init__(self, samFile, bootKey, isRemote = False, perSecretCallback = lambda secret: _print_helper(secret), jsonFile=None):
         OfflineRegistry.__init__(self, samFile, isRemote)
         self.__samFile = samFile
         self.__hashedBootKey = ''
@@ -1111,6 +1142,10 @@ class SAMHashes(OfflineRegistry):
         self.__cryptoCommon = CryptoCommon()
         self.__itemsFound = {}
         self.__perSecretCallback = perSecretCallback
+        self.__jsonFile = jsonFile
+
+    def set_quiet(self):
+        self.__perSecretCallback = lambda secret: None
 
     def MD5(self, data):
         md5 = hashlib.new('md5')
@@ -1186,11 +1221,18 @@ class SAMHashes(OfflineRegistry):
         except:
             pass
 
+        if self.__jsonFile:
+            jsonout = {"type": "SAMHashes", "count": len(rids) }
+            ndjsondump(jsonout, self.__jsonFile)
+
         for rid in rids:
             userAccount = USER_ACCOUNT_V(self.getValue(ntpath.join(usersKey,rid,'V'))[1])
+            userAccountF = USER_ACCOUNT_F(self.getValue(ntpath.join(usersKey,rid,'F'))[1])
+
             rid = int(rid,16)
 
             V = userAccount['Data']
+            #F = userAccountF['Data']
 
             userName = V[userAccount['NameOffset']:userAccount['NameOffset']+userAccount['NameLength']].decode('utf-16le')
 
@@ -1224,6 +1266,35 @@ class SAMHashes(OfflineRegistry):
             answer =  "%s:%d:%s:%s:::" % (userName, rid, hexlify(lmHash), hexlify(ntHash))
             self.__itemsFound[rid] = answer
             self.__perSecretCallback(answer)
+            if self.__jsonFile:
+                jsonout = {
+                    "userName":userName,
+                    "rid":rid,
+                    "lmHash":hexlify(lmHash), 
+                    "ntHash":hexlify(ntHash), 
+                    "fullName": V[userAccount['FullNameOffset']:userAccount['FullNameOffset']+userAccount['FullNameLength']].decode('utf-16le'),
+                    "comment": V[userAccount['CommentOffset']:userAccount['CommentOffset']+userAccount['CommentLength']].decode('utf-16le'),
+                    "homeDir": V[userAccount['HomeDirOffset']:userAccount['HomeDirOffset']+userAccount['HomeDirLength']].decode('utf-16le'),
+                    "homeDirConnect": V[userAccount['HomeDirConnectOffset']:userAccount['HomeDirConnectOffset']+userAccount['HomeDirConnectLength']].decode('utf-16le'),
+                    "scriptPath": V[userAccount['ScriptPathOffset']:userAccount['ScriptPathOffset']+userAccount['ScriptPathLength']].decode('utf-16le'),
+                    "profilePath": V[userAccount['ProfilePathOffset']:userAccount['ProfilePathOffset']+userAccount['ProfilePathLength']].decode('utf-16le'),
+                    "hoursAllowed": hexlify(V[userAccount['HoursAllowedOffset']:userAccount['HoursAllowedOffset']+userAccount['HoursAllowedLength']]),
+                    "lastLogon": userAccountF['LastLogon'],
+                    "lastLogoff": userAccountF['LastLogoff'],
+                    "passwordLastSet": userAccountF['PasswordLastSet'],
+                    "accountExpires": userAccountF['AccountExpires'],
+                    "badPasswordTime": userAccountF['BadPasswordTime'],
+                    "primaryGroupId": userAccountF['PrimaryGroupId'],
+                    "userAccountControl": userAccountF['UserAccountControl'],
+                    "countryCode": userAccountF['CountryCode'],
+                    "codePage": userAccountF['CodePage'],
+                    "badPasswordCount": userAccountF['BadPasswordCount'],
+                    "logonCount": userAccountF['LogonCount'],
+                    "adminCount": userAccountF['AdminCount'],
+                    "operatorCount": userAccountF['OperatorCount']
+                }
+                ndjsondump(jsonout, self.__jsonFile)
+
 
     def export(self, fileName):
         if len(self.__itemsFound) > 0:
@@ -1241,7 +1312,7 @@ class LSASecrets(OfflineRegistry):
         LSA_RAW = 2
 
     def __init__(self, securityFile, bootKey, remoteOps=None, isRemote=False, history=False,
-                 perSecretCallback=lambda secretType, secret: _print_helper(secret)):
+                 perSecretCallback=lambda secretType, secret: _print_helper(secret), jsonFile=None):
         OfflineRegistry.__init__(self, securityFile, isRemote)
         self.__hashedBootKey = ''
         self.__bootKey = bootKey
@@ -1254,7 +1325,13 @@ class LSASecrets(OfflineRegistry):
         self.__cachedItems = []
         self.__secretItems = []
         self.__perSecretCallback = perSecretCallback
+        self.__jsonFile = jsonFile
         self.__history = history
+        self.__quiet = False
+
+    def set_quiet(self):
+        self.__perSecretCallback = lambda secretType, secret: None
+        self.__quiet = True
 
     def MD5(self, data):
         md5 = hashlib.new('md5')
@@ -1372,6 +1449,10 @@ class LSASecrets(OfflineRegistry):
         self.__getLSASecretKey()
         self.__getNLKMSecret()
 
+        if self.__jsonFile:
+            jsonout = {"type": "CachedHashes", "count": len(values) }
+            ndjsondump(jsonout, self.__jsonFile)
+
         for value in values:
             LOG.debug('Looking into %s' % value)
             record = NL_RECORD(self.getValue(ntpath.join('\\Cache',value))[1])
@@ -1383,10 +1464,15 @@ class LSASecrets(OfflineRegistry):
                         plainText = self.__cryptoCommon.decryptAES(self.__NKLMKey[16:32], record['EncryptedData'], record['IV'])
                     else:
                         plainText = self.__decryptHash(self.__NKLMKey, record['EncryptedData'], record['IV'])
-                        pass
                 else:
                     # Plain! Until we figure out what this is, we skip it
                     #plainText = record['EncryptedData']
+                    if self.__jsonFile:
+                        jsonout = {
+                            "valid": False,
+                            "encrypted":record['EncryptedData']
+                        }
+                        ndjsondump(jsonout, self.__jsonFile)
                     continue
                 encHash = plainText[:0x10]
                 plainText = plainText[0x48:]
@@ -1398,6 +1484,20 @@ class LSASecrets(OfflineRegistry):
                 answer = "%s:%s:%s:%s:::" % (userName, hexlify(encHash), domainLong, domain)
                 self.__cachedItems.append(answer)
                 self.__perSecretCallback(LSASecrets.SECRET_TYPE.LSA_HASHED, answer)
+                if self.__jsonFile:
+                    jsonout = {
+                        "valid": True,
+                        "userName":userName,
+                        "encHash":hexlify(encHash), 
+                        "domainLong":domainLong, 
+                        "domain":domain 
+                    }
+                    ndjsondump(jsonout, self.__jsonFile)
+            else:
+                if self.__jsonFile:
+                    jsonout = { "valid": False }
+                    ndjsondump(jsonout, self.__jsonFile)
+
 
     def __printSecret(self, name, secretItem):
         # Based on [MS-LSAD] section 3.1.1.4
@@ -1405,11 +1505,21 @@ class LSASecrets(OfflineRegistry):
         # First off, let's discard NULL secrets.
         if len(secretItem) == 0:
             LOG.debug('Discarding secret %s, NULL Data' % name)
+            if self.__jsonFile:
+                jsonout = {
+                    "valid": False,
+                }
+                ndjsondump(jsonout, self.__jsonFile)
             return
 
         # We might have secrets with zero
         if secretItem.startswith('\x00\x00'):
             LOG.debug('Discarding secret %s, all zeros' % name)
+            if self.__jsonFile:
+                jsonout = {
+                    "valid": False,
+                }
+                ndjsondump(jsonout, self.__jsonFile)
             return
 
         upperName = name.upper()
@@ -1417,12 +1527,15 @@ class LSASecrets(OfflineRegistry):
         LOG.info('%s ' % name)
 
         secret = ''
+        secretjson = { "valid":True }
 
         if upperName.startswith('_SC_'):
+            secretjson["type"]="service"
             # Service name, a password might be there
             # Let's first try to decode the secret
             try:
                 strDecoded = secretItem.decode('utf-16le')
+                secretjson["decoded"]=strDecoded
             except:
                 pass
             else:
@@ -1432,17 +1545,22 @@ class LSASecrets(OfflineRegistry):
                     account = self.__remoteOps.getServiceAccount(name[4:])
                     if account is None:
                         secret = self.UNKNOWN_USER + ':'
+                        secretjson["name"]=self.UNKNOWN_USER
                     else:
                         secret =  "%s:" % account
+                        secretjson["name"]=account
                 else:
                     # We don't support getting this info for local targets at the moment
                     secret = self.UNKNOWN_USER + ':'
+                    secretjson["name"]=self.UNKNOWN_USER
                 secret += strDecoded
         elif upperName.startswith('DEFAULTPASSWORD'):
+            secretjson["type"]="default_password"
             # defaults password for winlogon
             # Let's first try to decode the secret
             try:
                 strDecoded = secretItem.decode('utf-16le')
+                secretjson["decoded"]=strDecoded
             except:
                 pass
             else:
@@ -1451,28 +1569,39 @@ class LSASecrets(OfflineRegistry):
                     account = self.__remoteOps.getDefaultLoginAccount()
                     if account is None:
                         secret = self.UNKNOWN_USER + ':'
+                        secretjson["name"]=self.UNKNOWN_USER
                     else:
                         secret = "%s:" % account
+                        secretjson["name"]=account
                 else:
                     # We don't support getting this info for local targets at the moment
                     secret = self.UNKNOWN_USER + ':'
+                    secretjson["name"]=self.UNKNOWN_USER
                 secret += strDecoded
         elif upperName.startswith('ASPNET_WP_PASSWORD'):
+            secretjson["type"]="aspnet_wp_password"
             try:
                 strDecoded = secretItem.decode('utf-16le')
+                secretjson["decoded"]=strDecoded
             except:
                 pass
             else:
                 secret = 'ASPNET: %s' % strDecoded
         elif upperName.startswith('$MACHINE.ACC'):
+            secretjson["type"]="machine"
             # compute MD4 of the secret.. yes.. that is the nthash? :-o
             md4 = MD4.new()
             md4.update(secretItem)
             if hasattr(self.__remoteOps, 'getMachineNameAndDomain'):
                 machine, domain = self.__remoteOps.getMachineNameAndDomain()
                 secret = "%s\\%s$:%s:%s:::" % (domain, machine, hexlify(ntlm.LMOWFv1('','')), hexlify(md4.digest()))
+                secretjson["domain"]=domain
+                secretjson["machine"]=machine+"$"
             else:
                 secret = "$MACHINE.ACC: %s:%s" % (hexlify(ntlm.LMOWFv1('','')), hexlify(md4.digest()))
+                secretjson["name"]="$MACHINE.ACC"
+            secretjson["lmHash"]=hexlify(ntlm.LMOWFv1('',''))
+            secretjson["ntHash"]=hexlify(md4.digest())
 
         if secret != '':
             printableSecret = secret
@@ -1484,9 +1613,14 @@ class LSASecrets(OfflineRegistry):
             self.__secretItems.append(printableSecret)
             # If we're using the default callback (ourselves), we print the hex representation. If not, the
             # user will need to decide what to do.
-            if self.__module__ == self.__perSecretCallback.__module__:
+            if self.__module__ == self.__perSecretCallback.__module__ and not self.__quiet:
                 hexdump(secretItem)
             self.__perSecretCallback(LSASecrets.SECRET_TYPE.LSA_RAW, printableSecret)
+            secretjson["name"] = name
+            secretjson["secret"] = hexlify(secretItem)
+
+        if self.__jsonFile:
+            ndjsondump(secretjson, self.__jsonFile)   
 
     def dumpSecrets(self):
         if self.__securityFile is None:
@@ -1508,6 +1642,19 @@ class LSASecrets(OfflineRegistry):
 
         if self.__LSAKey == '':
             self.__getLSASecretKey()
+
+        if self.__jsonFile:
+            count = 0
+            for key in keys:
+                valueTypeList = ['CurrVal']
+                if self.__history:
+                    valueTypeList.append('OldVal')
+                for valueType in valueTypeList:
+                    value = self.getValue('\\Policy\\Secrets\\{}\\{}\\default'.format(key,valueType))
+                    if value is not None and value[1] != 0:
+                        count += 1
+            jsonout = {"type": "LSASecrets", "count": count}
+            ndjsondump(jsonout, self.__jsonFile)
 
         for key in keys:
             LOG.debug('Looking into %s' % key)
@@ -1618,7 +1765,7 @@ class NTDSHashes:
         'logonCount':'ATTj589993',
         'sAMAccountName':'ATTm590045',
         'sAMAccountType':'ATTj590126',
-        'lastLogonTimestamp':'ATTq589876',
+        'lastLogon':'ATTq589876',
         'userPrincipalName':'ATTm590480',
         'unicodePwd':'ATTk589914',
         'dBCSPwd':'ATTk589879',
@@ -1627,6 +1774,9 @@ class NTDSHashes:
         'pekList':'ATTk590689',
         'supplementalCredentials':'ATTk589949',
         'pwdLastSet':'ATTq589920',
+        'badPasswordTime':'ATTq589873',
+        'badPasswordCount':'ATTj589836',
+        'unixPwd':'ATTk591734',
     }
 
     NAME_TO_ATTRTYP = {
@@ -1639,6 +1789,15 @@ class NTDSHashes:
         'supplementalCredentials': 0x9007D,
         'objectSid': 0x90092,
         'userAccountControl':0x90008,
+        'primaryGroupID':0x90062,
+        'accountExpires':0x9009F,
+        'logonCount':0x900A9,
+        'sAMAccountType':0x9012E,
+        'lastLogonp':0x90034,
+        'pwdLastSet':0x90060,
+        'badPasswordTime':0x90031,
+        'badPasswordCount':0x9000C,
+        'unixPwd':0x90776,
     }
 
     ATTRTYP_TO_ATTID = {
@@ -1652,6 +1811,14 @@ class NTDSHashes:
         'objectSid': '1.2.840.113556.1.4.146',
         'pwdLastSet': '1.2.840.113556.1.4.96',
         'userAccountControl':'1.2.840.113556.1.4.8',
+        'primaryGroupID':'1.2.840.113556.1.4.98',
+        'accountExpires':'1.2.840.113556.1.4.159',
+        'logonCount':'1.2.840.113556.1.4.169',
+        'sAMAccountType': '1.2.840.113556.1.4.302',
+        'lastLogon':'1.2.840.113556.1.4.52',
+        'badPasswordTime':'1.2.840.113556.1.4.49',
+        'badPwdCount':'1.2.840.113556.1.4.12',
+        'unixUserPassword':'1.2.840.113556.1.4.1910',
     }
 
     KERBEROS_TYPE = {
@@ -1723,7 +1890,8 @@ class NTDSHashes:
                  useVSSMethod=False, justNTLM=False, pwdLastSet=False, resumeSession=None, outputFileName=None,
                  justUser=None, printUserStatus=False,
                  perSecretCallback = lambda secretType, secret : _print_helper(secret),
-                 resumeSessionMgr=ResumeSessionMgrInFile):
+                 resumeSessionMgr=ResumeSessionMgrInFile,
+                 jsonFile = None):
         self.__bootKey = bootKey
         self.__NTDS = ntdsFile
         self.__history = history
@@ -1745,6 +1913,12 @@ class NTDSHashes:
         self.__outputFileName = outputFileName
         self.__justUser = justUser
         self.__perSecretCallback = perSecretCallback
+        self.__jsonFile = jsonFile
+        self.__quiet = False
+
+    def set_quiet(self):
+        self.__perSecretCallback = lambda secretType, secret: None
+        self.__quiet=True
 
     def getResumeSessionFile(self):
         return self.__resumeSession.getFileName()
@@ -1951,11 +2125,16 @@ class NTDSHashes:
 
     def __decryptHash(self, record, prefixTable=None, outputFile=None):
         LOG.debug('Entering NTDSHashes.__decryptHash')
+        
+        jsonout = {}
+
         if self.__useVSSMethod is True:
             LOG.debug('Decrypting hash for user: %s' % record[self.NAME_TO_INTERNAL['name']])
+            jsonout["name"]=record[self.NAME_TO_INTERNAL['name']]
 
             sid = SAMR_RPC_SID(unhexlify(record[self.NAME_TO_INTERNAL['objectSid']]))
             rid = sid.formatCanonical().split('-')[-1]
+            jsonout["rid"]=rid
 
             if record[self.NAME_TO_INTERNAL['dBCSPwd']] is not None:
                 encryptedLMHash = self.CRYPTED_HASH(unhexlify(record[self.NAME_TO_INTERNAL['dBCSPwd']]))
@@ -1963,7 +2142,8 @@ class NTDSHashes:
                 LMHash = self.__removeDESLayer(tmpLMHash, rid)
             else:
                 LMHash = ntlm.LMOWFv1('', '')
-
+            jsonout["lmHash"]=hexlify(LMHash)
+            
             if record[self.NAME_TO_INTERNAL['unicodePwd']] is not None:
                 encryptedNTHash = self.CRYPTED_HASH(unhexlify(record[self.NAME_TO_INTERNAL['unicodePwd']]))
                 if encryptedNTHash['Header'][:4] == '\x13\x00\x00\x00':
@@ -1978,12 +2158,15 @@ class NTDSHashes:
                 NTHash = self.__removeDESLayer(tmpNTHash, rid)
             else:
                 NTHash = ntlm.NTOWFv1('', '')
+            jsonout["ntHash"]=hexlify(NTHash)
 
             if record[self.NAME_TO_INTERNAL['userPrincipalName']] is not None:
                 domain = record[self.NAME_TO_INTERNAL['userPrincipalName']].split('@')[-1]
                 userName = '%s\\%s' % (domain, record[self.NAME_TO_INTERNAL['sAMAccountName']])
+                jsonout["domain"]=domain
             else:
                 userName = '%s' % record[self.NAME_TO_INTERNAL['sAMAccountName']]
+                jsonout["userName"]=userName
 
             if self.__printUserStatus is True:
                 # Enabled / disabled users
@@ -1994,9 +2177,11 @@ class NTDSHashes:
                         userAccountStatus = 'Enabled'
                 else:
                     userAccountStatus = 'N/A'
+            jsonout["userAccountControl"]=record[self.NAME_TO_INTERNAL['userAccountControl']]
 
             if record[self.NAME_TO_INTERNAL['pwdLastSet']] is not None:
                 pwdLastSet = self.__fileTimeToDateTime(record[self.NAME_TO_INTERNAL['pwdLastSet']])
+                jsonout["pwdLastSet"]=record[self.NAME_TO_INTERNAL['pwdLastSet']]
             else:
                 pwdLastSet = 'N/A'
 
@@ -2008,6 +2193,20 @@ class NTDSHashes:
 
             self.__perSecretCallback(NTDSHashes.SECRET_TYPE.NTDS, answer)
 
+            jsonout["primaryGroupId"]=record[self.NAME_TO_INTERNAL['primaryGroupID']]
+            jsonout["accountExpires"]=record[self.NAME_TO_INTERNAL['accountExpires']]
+            jsonout["logonCount"]=record[self.NAME_TO_INTERNAL['logonCount']]
+            jsonout["accountType"]=record[self.NAME_TO_INTERNAL['sAMAccountType']]
+            jsonout["lastLogon"]=record[self.NAME_TO_INTERNAL['lastLogon']]
+            if self.NAME_TO_INTERNAL['userPrincipalName'] in record:
+                if record[self.NAME_TO_INTERNAL['userPrincipalName']] is not None:
+                    jsonout["userPrincipalName"]=record[self.NAME_TO_INTERNAL['userPrincipalName']]
+            jsonout["badPasswordTime"]=record[self.NAME_TO_INTERNAL['badPasswordTime']]
+            jsonout["badPasswordCount"]=record[self.NAME_TO_INTERNAL['badPasswordCount']]
+            if self.NAME_TO_INTERNAL['unixPwd'] in record:
+                if record[self.NAME_TO_INTERNAL['unixPwd']] is not None:
+                    jsonout["unixPwd"]=record[self.NAME_TO_INTERNAL['unixPwd']]
+
             if outputFile is not None:
                 self.__writeOutput(outputFile, answer + '\n')
 
@@ -2017,13 +2216,16 @@ class NTDSHashes:
                 if record[self.NAME_TO_INTERNAL['lmPwdHistory']] is not None:
                     encryptedLMHistory = self.CRYPTED_HISTORY(unhexlify(record[self.NAME_TO_INTERNAL['lmPwdHistory']]))
                     tmpLMHistory = self.__removeRC4Layer(encryptedLMHistory)
+                    jsonlmhistory = []
                     for i in range(0, len(tmpLMHistory) / 16):
                         LMHash = self.__removeDESLayer(tmpLMHistory[i * 16:(i + 1) * 16], rid)
                         LMHistory.append(LMHash)
+                        jsonlmhistory.append(hexlify(LMHash))
+                    jsonout["lmHashHistory"]=jsonlmhistory
 
                 if record[self.NAME_TO_INTERNAL['ntPwdHistory']] is not None:
                     encryptedNTHistory = self.CRYPTED_HISTORY(unhexlify(record[self.NAME_TO_INTERNAL['ntPwdHistory']]))
-
+                    jsonnthistory = []
                     if encryptedNTHistory['Header'][:4] == '\x13\x00\x00\x00':
                         # Win2016 TP4 decryption is different
                         pekIndex = hexlify(encryptedNTHistory['Header'])
@@ -2036,6 +2238,8 @@ class NTDSHashes:
                     for i in range(0, len(tmpNTHistory) / 16):
                         NTHash = self.__removeDESLayer(tmpNTHistory[i * 16:(i + 1) * 16], rid)
                         NTHistory.append(NTHash)
+                        jsonnthistory.append(hexlify(NTHash))
+                    jsonout["ntHashHistory"]=jsonnthistory
 
                 for i, (LMHash, NTHash) in enumerate(
                         map(lambda l, n: (l, n) if l else ('', n), LMHistory[1:], NTHistory[1:])):
@@ -2050,13 +2254,18 @@ class NTDSHashes:
                     self.__perSecretCallback(NTDSHashes.SECRET_TYPE.NTDS, answer)
         else:
             replyVersion = 'V%d' %record['pdwOutVersion']
-            LOG.debug('Decrypting hash for user: %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+            user = record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1]
+            LOG.debug('Decrypting hash for user: %s' % user)
+            jsonout["user"] = user
             domain = None
             if self.__history:
                 LMHistory = []
                 NTHistory = []
+                jsonout["lmHashHistory"]=[]
+                jsonout["ntHashHistory"]=[]
 
             rid = unpack('<L', record['pmsgOut'][replyVersion]['pObjects']['Entinf']['pName']['Sid'][-4:])[0]
+            jsonout["rid"]=rid
 
             for attr in record['pmsgOut'][replyVersion]['pObjects']['Entinf']['AttrBlock']['pAttr']:
                 try:
@@ -2075,6 +2284,7 @@ class NTDSHashes:
                         LMHash = drsuapi.removeDESLayer(encryptedLMHash, rid)
                     else:
                         LMHash = ntlm.LMOWFv1('', '')
+                    jsonout["lmHash"]=helify(LMHash)
                 elif attId == LOOKUP_TABLE['unicodePwd']:
                     if attr['AttrVal']['valCount'] > 0:
                         encryptedUnicodePwd = ''.join(attr['AttrVal']['pAVal'][0]['pVal'])
@@ -2082,10 +2292,18 @@ class NTDSHashes:
                         NTHash = drsuapi.removeDESLayer(encryptedNTHash, rid)
                     else:
                         NTHash = ntlm.NTOWFv1('', '')
+                    jsonout["ntHash"]=hexlify(LMHash)
+                elif attId == LOOKUP_TABLE['unixPwd']:
+                    unixPwd = ''.join(attr['AttrVal']['pAVal'][0]['pVal'])
+                    # Is this encrypted too?
+                    jsonout["unixPwd"]=hexlify(unixPwd)
                 elif attId == LOOKUP_TABLE['userPrincipalName']:
                     if attr['AttrVal']['valCount'] > 0:
                         try:
-                            domain = ''.join(attr['AttrVal']['pAVal'][0]['pVal']).decode('utf-16le').split('@')[-1]
+                            userPrincipalName = ''.join(attr['AttrVal']['pAVal'][0]['pVal']).decode('utf-16le')
+                            domain = userPrincipalName.split('@')[-1]
+                            jsonout["userPrincipalName"]=userPrincipalName
+                            jsonout["domain"]=domain
                         except:
                             domain = None
                     else:
@@ -2094,12 +2312,14 @@ class NTDSHashes:
                     if attr['AttrVal']['valCount'] > 0:
                         try:
                             userName = ''.join(attr['AttrVal']['pAVal'][0]['pVal']).decode('utf-16le')
+                            jsonout["userName"]=userName
                         except:
                             LOG.error('Cannot get sAMAccountName for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
                             userName = 'unknown'
                     else:
                         LOG.error('Cannot get sAMAccountName for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
                         userName = 'unknown'
+                    
                 elif attId == LOOKUP_TABLE['objectSid']:
                     if attr['AttrVal']['valCount'] > 0:
                         objectSid = ''.join(attr['AttrVal']['pAVal'][0]['pVal'])
@@ -2109,19 +2329,74 @@ class NTDSHashes:
                 elif attId == LOOKUP_TABLE['pwdLastSet']:
                     if attr['AttrVal']['valCount'] > 0:
                         try:
-                            pwdLastSet = self.__fileTimeToDateTime(unpack('<Q', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0])
+                            pwdLastSetQ = unpack('<Q', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            pwdLastSet = self.__fileTimeToDateTime(pwdLastSetQ)
+                            jsonout["pwdLastSet"]=pwdLastSetQ
                         except:
                             LOG.error('Cannot get pwdLastSet for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
                             pwdLastSet = 'N/A'
-                elif self.__printUserStatus and attId == LOOKUP_TABLE['userAccountControl']:
+                elif attId == LOOKUP_TABLE['userAccountControl']:
                     if attr['AttrVal']['valCount'] > 0:
-                        if (unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]) & samr.UF_ACCOUNTDISABLE:
+                        userAccountControl = unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                        if userAccountControl & samr.UF_ACCOUNTDISABLE:
                             userAccountStatus = 'Disabled'
                         else:
                             userAccountStatus = 'Enabled'
+                        jsonout["userAccountControl"]=userAccountControl
                     else:
                         userAccountStatus = 'N/A'
-
+                    if not self.__printUserStatus:
+                        del userAccountStatus
+                elif attId == LOOKUP_TABLE['primaryGroupID']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            primaryGroupId = unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["primaryGroupId"]=primaryGroupId
+                        except:
+                            LOG.error('Cannot get primaryGroupID for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['accountExpires']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            accountExpires = unpack('<Q', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["accountExpires"]=accountExpires
+                        except:
+                            LOG.error('Cannot get accountExpires for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['logonCount']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            logonCount = unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["logonCount"]=logonCount
+                        except:
+                            LOG.error('Cannot get logonCount for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['sAMAccountType']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            sAMAccountType = unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["sAMAccountType"]=sAMAccountType
+                        except:
+                            LOG.error('Cannot get sAMAccountType for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['lastLogon']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            lastLogon = unpack('<Q', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["lastLogon"]=lastLogon
+                        except:
+                            LOG.error('Cannot get lastLogon for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['badPasswordTime']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            badPasswordTime = unpack('<Q', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["badPasswordTime"]=badPasswordTime
+                        except:
+                            LOG.error('Cannot get badPasswordTime for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                elif attId == LOOKUP_TABLE['badPasswordCount']:
+                    if attr['AttrVal']['valCount'] > 0:
+                        try:
+                            badPasswordCount = unpack('<L', ''.join(attr['AttrVal']['pAVal'][0]['pVal']))[0]
+                            jsonout["badPasswordCount"]=badPasswordCount
+                        except:
+                            LOG.error('Cannot get badPasswordCount for %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
+                
                 if self.__history:
                     if attId == LOOKUP_TABLE['lmPwdHistory']:
                         if attr['AttrVal']['valCount'] > 0:
@@ -2130,6 +2405,7 @@ class NTDSHashes:
                             for i in range(0, len(tmpLMHistory) / 16):
                                 LMHashHistory = drsuapi.removeDESLayer(tmpLMHistory[i * 16:(i + 1) * 16], rid)
                                 LMHistory.append(LMHashHistory)
+                                jsonout["lmHashHistory"].append(hexlify(LMHashHistory))
                         else:
                             LOG.debug('No lmPwdHistory for user %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
                     elif attId == LOOKUP_TABLE['ntPwdHistory']:
@@ -2139,6 +2415,7 @@ class NTDSHashes:
                             for i in range(0, len(tmpNTHistory) / 16):
                                 NTHashHistory = drsuapi.removeDESLayer(tmpNTHistory[i * 16:(i + 1) * 16], rid)
                                 NTHistory.append(NTHashHistory)
+                                jsonout["ntHashHistory"].append(hexlify(NTHashHistory))
                         else:
                             LOG.debug('No ntPwdHistory for user %s' % record['pmsgOut'][replyVersion]['pNC']['StringName'][:-1])
 
@@ -2170,6 +2447,9 @@ class NTDSHashes:
 
         if outputFile is not None:
             outputFile.flush()
+
+        if self.__jsonFile:
+            ndjsondump(jsonout, self.__jsonFile)
 
         LOG.debug('Leaving NTDSHashes.__decryptHash')
 
@@ -2219,6 +2499,10 @@ class NTDSHashes:
                     clearTextOutputFile = codecs.open(self.__outputFileName+'.ntds.cleartext',mode, encoding='utf-8')            
 
             LOG.info('Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)')
+            if self.__jsonFile:
+                jsonout = {"type": "NTDSHashes" }   # Don't know the count
+                ndjsondump(jsonout, self.__jsonFile)
+
             if self.__useVSSMethod:
                 # We start getting rows from the table aiming at reaching
                 # the pekList. If we find users records we stored them
@@ -2235,7 +2519,7 @@ class NTDSHashes:
                         except Exception, e:
                             if logging.getLogger().level == logging.DEBUG:
                                 import traceback
-                                print traceback.print_exc()
+                                eprint(traceback.print_exc())
                             try:
                                 LOG.error(
                                     "Error while processing row for user %s" % record[self.NAME_TO_INTERNAL['name']])
@@ -2264,7 +2548,7 @@ class NTDSHashes:
                         except Exception, e:
                             if logging.getLogger().level == logging.DEBUG:
                                 import traceback
-                                print traceback.print_exc()
+                                eprint(traceback.print_exc())
                             try:
                                 LOG.error(
                                     "Error while processing row for user %s" % record[self.NAME_TO_INTERNAL['name']])
@@ -2383,7 +2667,7 @@ class NTDSHashes:
                             except Exception, e:
                                 if logging.getLogger().level == logging.DEBUG:
                                     import traceback
-                                    print traceback.print_exc()
+                                    eprint(traceback.print_exc())
                                 LOG.error("Error while processing user!")
                                 LOG.error(str(e))
 
@@ -2494,4 +2778,4 @@ class LocalOperations:
         return True
 
 def _print_helper(*args, **kwargs):
-    print args[-1]
+    print(args[-1])

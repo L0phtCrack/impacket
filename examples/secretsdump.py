@@ -43,17 +43,20 @@
 # http://www.ntdsxtract.com/downloads/ActiveDirectoryOfflineHashDumpAndForensics.pdf
 # http://www.passcape.com/index.php?section=blog&cmd=details&id=15
 #
-import argparse
+from __future__ import print_function
 import codecs
 import logging
 import os
 import sys
+import argparse
 
 from impacket import version
 from impacket.examples import logger
 from impacket.smbconnection import SMBConnection
-
 from impacket.examples.secretsdump import LocalOperations, RemoteOperations, SAMHashes, LSASecrets, NTDSHashes
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)    
 
 class DumpSecrets:
     def __init__(self, remoteName, username='', password='', domain='', options=None):
@@ -80,6 +83,8 @@ class DumpSecrets:
         self.__noLMHash = True
         self.__isRemote = True
         self.__outputFileName = options.outputfile
+        self.__jsonFileName = options.jsonfile
+        self.__quiet = options.quiet
         self.__doKerberos = options.k
         self.__justDC = options.just_dc
         self.__justDCNTLM = options.just_dc_ntlm
@@ -104,6 +109,13 @@ class DumpSecrets:
 
     def dump(self):
         try:
+            jsonfile = None
+            if self.__jsonFileName:
+                if self.__jsonFileName == '-':
+                    jsonfile = sys.stdout
+                else:
+                    jsonfile = open(self.__jsonFileName,'w')
+
             if self.__remoteName.upper() == 'LOCAL' and self.__username == '':
                 self.__isRemote = False
                 self.__useVSSMethod = True
@@ -158,12 +170,18 @@ class DumpSecrets:
                     else:
                         SAMFileName         = self.__samHive
 
-                    self.__SAMHashes    = SAMHashes(SAMFileName, bootKey, isRemote = self.__isRemote)
+                    self.__SAMHashes    = SAMHashes(SAMFileName, bootKey, isRemote = self.__isRemote, jsonFile = jsonfile)
+                    if(self.__quiet):
+                        self.__SAMHashes.set_quiet()
                     self.__SAMHashes.dump()
                     if self.__outputFileName is not None:
                         self.__SAMHashes.export(self.__outputFileName)
                 except Exception, e:
+                    if logging.getLogger().level == logging.DEBUG:
+                        import traceback
+                        eprint(traceback.print_exc())
                     logging.error('SAM hashes extraction failed: %s' % str(e))
+
 
                 try:
                     if self.__isRemote is True:
@@ -172,7 +190,9 @@ class DumpSecrets:
                         SECURITYFileName = self.__securityHive
 
                     self.__LSASecrets = LSASecrets(SECURITYFileName, bootKey, self.__remoteOps,
-                                                   isRemote=self.__isRemote, history=self.__history)
+                                                   isRemote=self.__isRemote, history=self.__history, jsonFile = jsonfile)
+                    if(self.__quiet):
+                        self.__LSASecrets.set_quiet()
                     self.__LSASecrets.dumpCachedHashes()
                     if self.__outputFileName is not None:
                         self.__LSASecrets.exportCached(self.__outputFileName)
@@ -182,7 +202,7 @@ class DumpSecrets:
                 except Exception, e:
                     if logging.getLogger().level == logging.DEBUG:
                         import traceback
-                        print traceback.print_exc()
+                        eprint(traceback.print_exc())
                     logging.error('LSA hashes extraction failed: %s' % str(e))
 
             # NTDS Extraction we can try regardless of RemoteOperations failing. It might still work
@@ -199,13 +219,15 @@ class DumpSecrets:
                                            useVSSMethod=self.__useVSSMethod, justNTLM=self.__justDCNTLM,
                                            pwdLastSet=self.__pwdLastSet, resumeSession=self.__resumeFileName,
                                            outputFileName=self.__outputFileName, justUser=self.__justUser,
-                                           printUserStatus= self.__printUserStatus)
+                                           printUserStatus= self.__printUserStatus, jsonFile = jsonfile)
+            if(self.__quiet):
+                self.__NTDSHashes.set_quiet()
             try:
                 self.__NTDSHashes.dump()
             except Exception, e:
                 if logging.getLogger().level == logging.DEBUG:
                     import traceback
-                    print traceback.print_exc()
+                    eprint(traceback.print_exc())
                 if str(e).find('ERROR_DS_DRA_BAD_DN') >= 0:
                     # We don't store the resume file if this error happened, since this error is related to lack
                     # of enough privileges to access DRSUAPI.
@@ -223,7 +245,7 @@ class DumpSecrets:
         except (Exception, KeyboardInterrupt), e:
             if logging.getLogger().level == logging.DEBUG:
                 import traceback
-                print traceback.print_exc()
+                eprint(traceback.print_exc())
             logging.error(e)
             if self.__NTDSHashes is not None:
                 if isinstance(e, KeyboardInterrupt):
@@ -268,8 +290,6 @@ if __name__ == '__main__':
         # Output is redirected to a file
         sys.stdout = codecs.getwriter('utf8')(sys.stdout)
 
-    print version.BANNER
-
     parser = argparse.ArgumentParser(add_help = True, description = "Performs various techniques to dump secrets from "
                                                       "the remote machine without executing any agent there.")
 
@@ -286,6 +306,8 @@ if __name__ == '__main__':
                          'state')
     parser.add_argument('-outputfile', action='store',
                         help='base output filename. Extensions will be added for sam, secrets, cached and ntds')
+    parser.add_argument('-jsonfile', action='store',
+                        help='json output filename. Everything dumped will also be stored to this file in json format. Use "-" to print to stdout (implies -quiet).')
     parser.add_argument('-use-vss', action='store_true', default=False,
                         help='Use the VSS method insead of default DRSUAPI')
     parser.add_argument('-exec-method', choices=['smbexec', 'wmiexec', 'mmcexec'], nargs='?', default='smbexec', help='Remote exec '
@@ -303,6 +325,7 @@ if __name__ == '__main__':
     group.add_argument('-user-status', action='store_true', default=False,
                         help='Display whether or not the user is disabled')
     group.add_argument('-history', action='store_true', help='Dump password history, and LSA secrets OldVal')
+    group.add_argument('-quiet', action='store_true', help='Display no output. Useful when outputting to a file only')
     group = parser.add_argument_group('authentication')
 
     group.add_argument('-hashes', action="store", metavar = "LMHASH:NTHASH", help='NTLM hashes, format is LMHASH:NTHASH')
@@ -324,6 +347,15 @@ if __name__ == '__main__':
         sys.exit(1)
 
     options = parser.parse_args()
+
+    if options.jsonfile and options.jsonfile == '-':
+        # If printing json to stdout, only print json to stdout and nothing else
+        options.quiet = True
+
+    if not options.quiet:
+        print(version.BANNER)
+    else:
+        logging.disable(logging.INFO)
 
     if options.debug is True:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -388,5 +420,5 @@ if __name__ == '__main__':
     except Exception, e:
         if logging.getLogger().level == logging.DEBUG:
             import traceback
-            print traceback.print_exc()
+            eprint(traceback.print_exc())
         logging.error(e)
